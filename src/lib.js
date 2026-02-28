@@ -1,4 +1,4 @@
-import { updateYFragment, createNodeFromYElement, yattr2markname, createEmptyMeta } from './plugins/sync-plugin.js' // eslint-disable-line
+import { updateYFragment, createNodeFromYElement, yattr2markname, createEmptyMeta, decodeElementAttrsForJSON } from './plugins/sync-plugin.js' // eslint-disable-line
 import { ySyncPluginKey } from './plugins/keys.js'
 import * as Y from 'yjs'
 import { EditorView } from 'prosemirror-view' // eslint-disable-line
@@ -417,8 +417,12 @@ export function yXmlFragmentToProsemirrorJSON (xmlFragment) {
       }
 
       const attrs = item.getAttributes()
-      if (Object.keys(attrs).length) {
-        response.attrs = attrs
+      const { nodeAttrs, marks } = decodeElementAttrsForJSON(attrs)
+      if (Object.keys(nodeAttrs).length) {
+        response.attrs = nodeAttrs
+      }
+      if (marks.length) {
+        response.marks = marks
       }
 
       const children = item.toArray()

@@ -136,6 +136,113 @@ export const testOverlappingMarks = (_tc) => {
   t.compare(backandforth.content[0].content, JSON.parse(expected))
 }
 
+// --- Inline node marks test fixtures (shared by PM→Y, Y→PM, roundtrip) ---
+const NODE_MARKS_PREFIX = '__y_mark__'
+
+const makeMentionSchema = () =>
+  new Schema({
+    nodes: schema.spec.nodes.addToEnd('mention', {
+      inline: true,
+      group: 'inline',
+      atom: true,
+      attrs: { id: {} },
+      parseDOM: [{ tag: 'span[data-mention-id]', getAttrs: dom => ({ id: dom.getAttribute('data-mention-id') }) }],
+      toDOM: node => ['span', { 'data-mention-id': node.attrs.id }, 0]
+    }),
+    marks: schema.spec.marks
+  })
+
+/** PM doc: one paragraph, first inline is mention(id=u1) with single mark comment(id=c1). */
+const inlineNodeMarksStateJSON = {
+  type: 'doc',
+  content: [{
+    type: 'paragraph',
+    content: [
+      { type: 'mention', attrs: { id: 'u1' }, marks: [{ type: 'comment', attrs: { id: 'c1' } }] },
+      { type: 'text', text: ' hi' }
+    ]
+  }]
+}
+
+/** Deserialize Y attribute value (same convention as sync-plugin: __obj__ + JSON). */
+function deserializeMarkAttrValue (value) {
+  if (typeof value === 'string' && value.startsWith('__obj__')) {
+    try {
+      return JSON.parse(value.slice(7))
+    } catch (_) {
+      return value
+    }
+  }
+  return value
+}
+
+/**
+ * PM → Y (write path). Strict: after PM→Y, the Y element for the mention must store
+ * the comment mark so that decoded attrs equal { id: 'c1' }; element must be the
+ * mention (nodeName + id attr).
+ *
+ * @param {t.TestCase} _tc
+ */
+export const testInlineNodeMarksPMToY = (_tc) => {
+  const mentionSchema = makeMentionSchema()
+  const ydoc = prosemirrorJSONToYDoc(mentionSchema, inlineNodeMarksStateJSON)
+  const fragment = ydoc.get('prosemirror', Y.XmlFragment)
+  const children = fragment.toArray()
+  t.assert(children.length >= 1, 'fragment must have at least one child (paragraph)')
+  const paragraph = children[0]
+  const pChildren = paragraph.toArray()
+  t.assert(pChildren.length >= 1, 'paragraph must have at least one child (mention)')
+  const mention = pChildren[0]
+  t.assert(mention.nodeName === 'mention', 'first inline must be mention element')
+  const attrs = mention.getAttributes()
+  t.compare(attrs.id, 'u1', 'mention must have node attr id=u1')
+  const commentKey = Object.keys(attrs).find(k =>
+    k === NODE_MARKS_PREFIX + 'comment' || k.startsWith(NODE_MARKS_PREFIX + 'comment--')
+  )
+  t.assert(commentKey != null, 'Y element must have attribute key __y_mark__comment or __y_mark__comment--*')
+  const decoded = deserializeMarkAttrValue(attrs[commentKey])
+  t.compare(decoded, { id: 'c1' }, 'comment mark attrs must decode to { id: "c1" }')
+}
+
+/**
+ * Y → PM (read path). Strict: Y doc that contains mention with __y_mark__ comment
+ * must produce PM JSON where that node has marks [{ type: "comment", attrs: { id: "c1" } }].
+ * We build Y via PM→Y so the Y structure is valid, then assert only Y→PM result.
+ *
+ * @param {t.TestCase} _tc
+ */
+export const testInlineNodeMarksYToPM = (_tc) => {
+  const mentionSchema = makeMentionSchema()
+  const ydoc = prosemirrorJSONToYDoc(mentionSchema, inlineNodeMarksStateJSON)
+  const pmJson = yDocToProsemirrorJSON(ydoc)
+  t.assert(pmJson.content != null && pmJson.content[0] != null, 'doc must have first block')
+  t.assert(pmJson.content[0].content != null && pmJson.content[0].content[0] != null, 'first block must have first inline')
+  const firstInline = pmJson.content[0].content[0]
+  t.compare(firstInline.type, 'mention', 'first inline must be mention')
+  t.compare(firstInline.attrs, { id: 'u1' }, 'mention must have attrs { id: "u1" }')
+  t.compare(
+    firstInline.marks,
+    [{ type: 'comment', attrs: { id: 'c1' } }],
+    'mention must have exactly one mark: comment with attrs { id: "c1" }'
+  )
+}
+
+/**
+ * PM → Y → PM roundtrip. Strict: full roundtrip preserves mention and its comment mark.
+ *
+ * @param {t.TestCase} _tc
+ */
+export const testInlineNodeMarksRoundtrip = (_tc) => {
+  const mentionSchema = makeMentionSchema()
+  const ydoc = prosemirrorJSONToYDoc(mentionSchema, inlineNodeMarksStateJSON)
+  const backandforth = JSON.parse(JSON.stringify(yDocToProsemirrorJSON(ydoc)))
+  t.compare(
+    backandforth.content[0].content[0].marks,
+    [{ type: 'comment', attrs: { id: 'c1' } }],
+    'inline node marks must survive roundtrip'
+  )
+}
+
 /**
  * @param {t.TestCase} tc
  */

@@ -732,7 +732,7 @@ export const createNodeFromYElement = (
 ) => {
   const children = []
   /**
-   * @param {Y.XmlElement | Y.XmlText} type
+   * @param {Y.XmlElement | Y.XmlText | Y.XmlHook} type
    */
   const createChildren = (type) => {
     if (type instanceof Y.XmlElement) {
@@ -747,14 +747,22 @@ export const createNodeFromYElement = (
       if (n !== null) {
         children.push(n)
       }
+    } else if (typeof (/** @type {{ toDelta?: unknown }} */ (type).toDelta) !== 'function') {
+      // No toDelta: XmlHook or unknown — reuse from mapping if present, else skip
+      const mapped = meta.mapping.get(type)
+      if (mapped !== undefined && mapped !== null && !Array.isArray(mapped) && mapped instanceof PModel.Node) {
+        children.push(mapped)
+      }
     } else {
+      // Text (Y.XmlText / Y.Text): has toDelta
+      const ytext = /** @type {Y.XmlText} */ (type)
       // If the next ytext exists and was created by us, move the content to the current ytext.
       // This is a fix for #160 -- duplication of characters when two Y.Text exist next to each
       // other.
-      const nextytext = /** @type {Y.ContentType} */ (type._item.right?.content)?.type
+      const nextytext = /** @type {Y.ContentType} */ (ytext._item.right?.content)?.type
       if (nextytext instanceof Y.Text && !nextytext._item.deleted && nextytext._item.id.client === nextytext.doc.clientID) {
-        type.applyDelta([
-          { retain: type.length },
+        ytext.applyDelta([
+          { retain: ytext.length },
           ...nextytext.toDelta()
         ])
         nextytext.doc.transact(tr => {
@@ -763,7 +771,7 @@ export const createNodeFromYElement = (
       }
       // now create the prosemirror text nodes
       const ns = createTextNodesFromYText(
-        type,
+        ytext,
         schema,
         meta,
         snapshot,
@@ -786,19 +794,20 @@ export const createNodeFromYElement = (
       .forEach(createChildren)
   }
   try {
-    const attrs = el.getAttributes(snapshot)
+    const rawAttrs = el.getAttributes(snapshot)
+    const { nodeAttrs, marks } = decodeElementAttrsToNodeAttrsAndMarks(rawAttrs, schema)
     if (snapshot !== undefined) {
       if (!isVisible(/** @type {Y.Item} */ (el._item), snapshot)) {
-        attrs.ychange = computeYChange
+        nodeAttrs.ychange = computeYChange
           ? computeYChange('removed', /** @type {Y.Item} */ (el._item).id)
           : { type: 'removed' }
       } else if (!isVisible(/** @type {Y.Item} */ (el._item), prevSnapshot)) {
-        attrs.ychange = computeYChange
+        nodeAttrs.ychange = computeYChange
           ? computeYChange('added', /** @type {Y.Item} */ (el._item).id)
           : { type: 'added' }
       }
     }
-    const node = schema.node(el.nodeName, attrs, children)
+    const node = schema.node(el.nodeName, nodeAttrs, children, marks)
     meta.mapping.set(el, node)
     return node
   } catch (e) {
@@ -878,6 +887,10 @@ const createTypeFromElementNode = (node, meta) => {
     if (val !== null && key !== 'ychange') {
       type.setAttribute(key, val)
     }
+  }
+  const markAttrs = encodeNodeMarksToElementAttrs(node.marks || [], meta)
+  for (const key in markAttrs) {
+    type.setAttribute(key, markAttrs[key])
   }
   type.insert(
     0,
@@ -979,8 +992,11 @@ const equalYTypePNode = (ytype, pnode) => {
     matchNodeName(ytype, pnode)
   ) {
     const normalizedContent = normalizePNodeContent(pnode)
+    const yRaw = ytype.getAttributes()
+    const { nodeAttrs: yNodeAttrs, marks: yMarks } = decodeElementAttrsToNodeAttrsAndMarks(yRaw, pnode.type.schema)
     return ytype._length === normalizedContent.length &&
-      equalAttrs(ytype.getAttributes(), pnode.attrs) &&
+      equalAttrs(yNodeAttrs, pnode.attrs) &&
+      equalMarks(yMarks, pnode.marks || []) &&
       ytype.toArray().every((ychild, i) =>
         equalYTypePNode(ychild, normalizedContent[i])
       )
@@ -1129,6 +1145,115 @@ const marksToAttributes = (marks, meta) => {
   return pattrs
 }
 
+/** Prefix for storing node marks on Y.XmlElement to avoid collision with node attrs */
+const NODE_MARKS_PREFIX = '__y_mark__'
+
+/**
+ * @param {any} value
+ * @return {string}
+ */
+const serializeMarkAttrValue = (value) => {
+  if (typeof value === 'string' && !value.startsWith('__obj__')) {
+    return value
+  }
+  return '__obj__' + JSON.stringify(value)
+}
+
+/**
+ * @param {any} value
+ * @return {any}
+ */
+const deserializeMarkAttrValue = (value) => {
+  if (typeof value === 'string' && value.startsWith('__obj__')) {
+    try {
+      return JSON.parse(value.slice(7))
+    } catch (_) {
+      return value
+    }
+  }
+  return value
+}
+
+/**
+ * @param {readonly import('prosemirror-model').Mark[]} marks
+ * @param {BindingMetadata} meta
+ * @return {Record<string, string>}
+ */
+const encodeNodeMarksToElementAttrs = (marks, meta) => {
+  /** @type {Record<string, string>} */
+  const result = {}
+  if (!marks || marks.length === 0) return result
+  marks.forEach((mark) => {
+    if (mark.type.name === 'ychange') return
+    const isOverlapping = map.setIfUndefined(meta.isOMark, mark.type, () => !mark.type.excludes(mark.type))
+    const key = NODE_MARKS_PREFIX + (isOverlapping ? `${mark.type.name}--${utils.hashOfJSON(mark.toJSON())}` : mark.type.name)
+    result[key] = serializeMarkAttrValue(mark.attrs)
+  })
+  return result
+}
+
+/**
+ * @param {Record<string, any>} attrs
+ * @param {import('prosemirror-model').Schema} schema
+ * @return {{ nodeAttrs: Record<string, any>, marks: Array<import('prosemirror-model').Mark> }}
+ */
+const decodeElementAttrsToNodeAttrsAndMarks = (attrs, schema) => {
+  const nodeAttrs = {}
+  const marks = []
+  for (const key in attrs) {
+    if (key.startsWith(NODE_MARKS_PREFIX)) {
+      const markKey = key.slice(NODE_MARKS_PREFIX.length)
+      const markName = yattr2markname(markKey)
+      if (schema.marks[markName]) {
+        const attrsVal = deserializeMarkAttrValue(attrs[key])
+        try {
+          marks.push(schema.mark(markName, attrsVal && typeof attrsVal === 'object' ? attrsVal : {}))
+        } catch (_) {
+          // skip invalid mark
+        }
+      }
+    } else {
+      nodeAttrs[key] = attrs[key]
+    }
+  }
+  return { nodeAttrs, marks }
+}
+
+/**
+ * @param {Array<import('prosemirror-model').Mark>} a
+ * @param {readonly import('prosemirror-model').Mark[]} b
+ */
+const equalMarks = (a, b) => {
+  if (a.length !== b.length) return false
+  return a.every((m) => b.some((n) => m.type.name === n.type.name && equalAttrs(m.attrs, n.attrs)))
+}
+
+/**
+ * Split Y element attrs into node attrs and marks (plain objects for JSON).
+ * Used by yXmlFragmentToProsemirrorJSON; no schema required.
+ *
+ * @param {Record<string, any>} attrs
+ * @return {{ nodeAttrs: Record<string, any>, marks: Array<{ type: string, attrs: Record<string, any> }> }}
+ */
+export const decodeElementAttrsForJSON = (attrs) => {
+  const nodeAttrs = {}
+  const marks = []
+  for (const key in attrs) {
+    if (key.startsWith(NODE_MARKS_PREFIX)) {
+      const markKey = key.slice(NODE_MARKS_PREFIX.length)
+      const markName = yattr2markname(markKey)
+      const attrsVal = deserializeMarkAttrValue(attrs[key])
+      marks.push({
+        type: markName,
+        attrs: attrsVal && typeof attrsVal === 'object' ? attrsVal : {}
+      })
+    } else {
+      nodeAttrs[key] = attrs[key]
+    }
+  }
+  return { nodeAttrs, marks }
+}
+
 /**
  * Update a yDom node by syncing the current content of the prosemirror node.
  *
@@ -1150,10 +1275,11 @@ export const updateYFragment = (y, yDomFragment, pNode, meta) => {
     throw new Error('node name mismatch!')
   }
   meta.mapping.set(yDomFragment, pNode)
-  // update attributes
+  // update attributes and node marks
   if (yDomFragment instanceof Y.XmlElement) {
     const yDomAttrs = yDomFragment.getAttributes()
     const pAttrs = pNode.attrs
+    const pEncodedMarks = encodeNodeMarksToElementAttrs(pNode.marks || [], meta)
     for (const key in pAttrs) {
       if (pAttrs[key] !== null) {
         if (yDomAttrs[key] !== pAttrs[key] && key !== 'ychange') {
@@ -1163,9 +1289,13 @@ export const updateYFragment = (y, yDomFragment, pNode, meta) => {
         yDomFragment.removeAttribute(key)
       }
     }
-    // remove all keys that are no longer in pAttrs
+    for (const key in pEncodedMarks) {
+      if (yDomAttrs[key] !== pEncodedMarks[key]) {
+        yDomFragment.setAttribute(key, pEncodedMarks[key])
+      }
+    }
     for (const key in yDomAttrs) {
-      if (pAttrs[key] === undefined) {
+      if (pAttrs[key] === undefined && pEncodedMarks[key] === undefined) {
         yDomFragment.removeAttribute(key)
       }
     }
